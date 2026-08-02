@@ -1,6 +1,6 @@
 {
-  "name": "Fluye — Asistente de rutina y sueño",
-  "short_name": "Fluye",
+  "name": "𝖿𝗅𝗈𝗐𝗌 — Asistente de rutina y sueño",
+  "short_name": "𝖿𝗅𝗈𝗐𝗌",
   "description": "Asistente personal que aprende tu rutina diaria y tus ciclos de sueño.",
   "start_url": "./index.html",
   "scope": "./",
