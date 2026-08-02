@@ -1,4 +1,4 @@
-# Fluye — Asistente de rutina y sueño
+# 𝖿𝗅𝗈𝗐𝗌 — Asistente de rutina y sueño
 
 Asistente personal (PWA) que aprende tu rutina diaria y tus ciclos de sueño para reducir la cantidad de decisiones que tomas cada mañana. Todo se registra con un solo toque; nada se escribe a mano.
 
