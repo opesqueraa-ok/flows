@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#03045e">
+<title>Fluye — Asistente de rutina y sueño</title>
+<meta name="description" content="Asistente personal que aprende tu rutina y tus ciclos de sueño.">
+
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ======= HEADER ======= -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Fluye</span>
+    </div>
+    <button id="btn-night-toggle" class="icon-btn" title="Modo noche" aria-label="Alternar modo noche">🌙</button>
+  </header>
+
+  <!-- ======= VIEWS ======= -->
+  <main id="views">
+
+    <!-- ---------- HOME ---------- -->
+    <section id="view-home" class="view active">
+      <div id="home-content"><!-- rendered by app.js --></div>
+    </section>
+
+    <!-- ---------- ROUTINES ---------- -->
+    <section id="view-routines" class="view">
+      <div class="view-header">
+        <h1>Rutinas</h1>
+        <button class="btn-primary small" id="btn-new-routine">+ Nueva rutina</button>
+      </div>
+      <div id="routines-list" class="stack"></div>
+
+      <div id="routine-editor" class="editor hidden">
+        <div class="editor-head">
+          <input id="routine-name-input" class="text-input" placeholder="Nombre de la rutina (ej. Universidad)">
+          <button id="btn-close-editor" class="icon-btn">✕</button>
+        </div>
+        <div id="activities-list" class="stack"></div>
+        <div class="add-activity-row">
+          <input id="new-activity-input" class="text-input" placeholder="Nueva actividad (ej. Terminé de bañarme)">
+          <button id="btn-add-activity" class="btn-secondary small">Añadir</button>
+        </div>
+        <button id="btn-set-active-routine" class="btn-primary full">Usar esta rutina</button>
+      </div>
+    </section>
+
+    <!-- ---------- SLEEP ---------- -->
+    <section id="view-sleep" class="view">
+      <div class="view-header"><h1>Sueño</h1></div>
+      <div id="sleep-content" class="stack"></div>
+    </section>
+
+    <!-- ---------- NOTES ---------- -->
+    <section id="view-notes" class="view">
+      <div class="view-header"><h1>Lo veo mañana</h1></div>
+      <p class="hint">Anota lo que ronda tu cabeza antes de dormir para soltarlo sin miedo a olvidarlo.</p>
+      <div class="add-activity-row">
+        <input id="new-note-input" class="text-input" placeholder="Escribe un pendiente...">
+        <button id="btn-add-note" class="btn-secondary small">Guardar</button>
+      </div>
+      <div id="notes-list" class="stack"></div>
+    </section>
+
+    <!-- ---------- SUMMARY ---------- -->
+    <section id="view-summary" class="view">
+      <div class="view-header"><h1>Resumen</h1></div>
+      <div id="summary-content" class="stack"></div>
+    </section>
+
+  </main>
+
+  <!-- ======= BOTTOM NAV ======= -->
+  <nav class="bottom-nav">
+    <button class="nav-btn active" data-view="home"><span class="nav-ico">●</span>Inicio</button>
+    <button class="nav-btn" data-view="routines"><span class="nav-ico">▤</span>Rutinas</button>
+    <button class="nav-btn" data-view="sleep"><span class="nav-ico">☾</span>Sueño</button>
+    <button class="nav-btn" data-view="notes"><span class="nav-ico">✎</span>Notas</button>
+    <button class="nav-btn" data-view="summary"><span class="nav-ico">◔</span>Resumen</button>
+  </nav>
+
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

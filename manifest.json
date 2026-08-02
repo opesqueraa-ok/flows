@@ -1,0 +1,14 @@
+{
+  "name": "Fluye — Asistente de rutina y sueño",
+  "short_name": "Fluye",
+  "description": "Asistente personal que aprende tu rutina diaria y tus ciclos de sueño.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4fcfe",
+  "theme_color": "#03045e",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
