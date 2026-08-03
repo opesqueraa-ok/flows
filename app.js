@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Fluye — Asistente de rutina y sueño
+   𝖿𝗅𝗈𝗐𝗌 — Asistente de rutina y sueño
    Toda la información se guarda localmente (localStorage). Sin servidores,
    sin cuentas, sin publicidad.
    ========================================================================== */
@@ -27,9 +27,11 @@ function defaultState(){
       }
     ],
     activeRoutineId: null,
-    sessions: [],        // {id, date, routineId, logs:[{activityId,time}], completed}
+    // logs: [{activityId, time (ISO|null), skipped:bool, excluded:bool}]
+    sessions: [],        // {id, date, routineId, logs:[...], completed}
     todaySessionId: null,
-    durationHistory: {},  // key `${routineId}::${activityId}` -> [ms,...]
+    homeViewMode: 'single', // 'single' = un paso a la vez | 'all' = lista completa
+    weekdayGoals: {},    // key `${routineId}::${weekday 0-6}` -> {activityId, time:"HH:MM"}
     sleepSessions: [],    // {id, mode, targetWake, sleepTime, wakeTime, cyclesPlanned, cyclesActual, energy, status}
     activeSleepSessionId: null,
     notes: []             // {id, text, date, done}
@@ -170,7 +172,7 @@ function startSession(routineId){
   return session;
 }
 
-function logNextActivity(){
+function logNextActivity(skip = false){
   const session = getTodaySession();
   if (!session) return;
   const routine = getRoutine(session.routineId);
@@ -179,32 +181,79 @@ function logNextActivity(){
   const activity = routine.activities[nextIndex];
   if (!activity) return;
 
-  const now = new Date().toISOString();
-  session.logs.push({ activityId: activity.id, time: now });
-
-  // Guardar duración desde la actividad anterior para aprendizaje de hábitos
-  if (nextIndex > 0){
-    const prevTime = new Date(session.logs[nextIndex-1].time);
-    const dur = new Date(now) - prevTime;
-    const key = `${routine.id}::${activity.id}`;
-    if (!state.durationHistory[key]) state.durationHistory[key] = [];
-    state.durationHistory[key].push(dur);
-    if (state.durationHistory[key].length > 60) state.durationHistory[key].shift();
-  }
+  session.logs.push({
+    activityId: activity.id,
+    time: skip ? null : new Date().toISOString(),
+    skipped: skip,
+    excluded: false
+  });
 
   if (session.logs.length === routine.activities.length){
     session.completed = true;
   }
 
   saveState();
-  return activity;
+  return { activity, skipped: skip };
 }
 
+function undoLastLog(){
+  const session = getTodaySession();
+  if (!session || !session.logs.length) return;
+  session.logs.pop();
+  session.completed = false;
+  saveState();
+}
+
+function toggleExcludeLog(sessionId, logIndex){
+  const session = state.sessions.find(s => s.id === sessionId);
+  if (!session || !session.logs[logIndex]) return;
+  session.logs[logIndex].excluded = !session.logs[logIndex].excluded;
+  saveState();
+}
+
+// Corrige la hora real de un paso ya registrado (ej. diste doble clic sin
+// querer y no alcanzaste a marcar en el momento correcto).
+function editLogTime(sessionId, logIndex, hh, mm, ss = 0){
+  const session = state.sessions.find(s => s.id === sessionId);
+  if (!session || !session.logs[logIndex]) return;
+  const log = session.logs[logIndex];
+  const base = log.time ? new Date(log.time) : new Date(session.date + 'T00:00:00');
+  base.setHours(hh, mm, ss, 0);
+  log.time = base.toISOString();
+  log.skipped = false;
+  saveState();
+}
+
+// Encuentra el índice del log válido (con hora real) inmediatamente anterior,
+// saltando los que fueron omitidos.
+function findPrevValidIndex(logs, index){
+  let j = index - 1;
+  while (j >= 0 && (logs[j].skipped || logs[j].time == null)) j--;
+  return j;
+}
+
+function sessionStepDuration(session, index){
+  const log = session.logs[index];
+  if (!log || log.skipped || log.time == null) return null;
+  const j = findPrevValidIndex(session.logs, index);
+  if (j < 0) return null;
+  return new Date(log.time) - new Date(session.logs[j].time);
+}
+
+// Promedio real calculado directamente de las sesiones guardadas (recalcula
+// siempre en el momento, así que respeta ediciones y exclusiones).
 function averageDuration(routineId, activityId){
-  const key = `${routineId}::${activityId}`;
-  const arr = state.durationHistory[key];
-  if (!arr || !arr.length) return null;
-  return arr.reduce((a,b)=>a+b,0) / arr.length;
+  const durations = [];
+  state.sessions.forEach(s => {
+    if (s.routineId !== routineId) return;
+    s.logs.forEach((log, i) => {
+      if (log.activityId !== activityId || log.excluded) return;
+      const d = sessionStepDuration(s, i);
+      if (d != null) durations.push(d);
+    });
+  });
+  if (!durations.length) return null;
+  return durations.reduce((a,b)=>a+b,0) / durations.length;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -214,20 +263,65 @@ function averageDuration(routineId, activityId){
 // Dado un tiempo objetivo (Date) para completar la última actividad de la
 // rutina, calcula hacia atrás usando los promedios históricos (o un valor
 // por defecto de 8 min si aún no hay datos) el horario ideal de cada paso.
-function computeBackwardPlan(routineId, targetDate){
+function computeBackwardPlan(routineId, targetDate, anchorActivityId = null){
   const routine = getRoutine(routineId);
   if (!routine || !routine.activities.length) return [];
   const acts = routine.activities;
-  const times = new Array(acts.length);
-  times[acts.length-1] = targetDate;
+  const anchorIndex = anchorActivityId
+    ? acts.findIndex(a => a.id === anchorActivityId)
+    : acts.length - 1;
+  const lastIndex = anchorIndex >= 0 ? anchorIndex : acts.length - 1;
 
-  for (let i = acts.length-1; i > 0; i--){
+  const times = new Array(lastIndex + 1);
+  times[lastIndex] = targetDate;
+
+  for (let i = lastIndex; i > 0; i--){
     const avg = averageDuration(routineId, acts[i].id);
     const durationMs = avg != null ? avg : 8*60000; // valor de arranque razonable
     times[i-1] = new Date(times[i].getTime() - durationMs);
   }
 
-  return acts.map((a,i) => ({ activity: a, time: times[i], estimated: averageDuration(routineId, a.id) == null }));
+  return acts.slice(0, lastIndex + 1).map((a,i) => ({
+    activity: a, time: times[i], estimated: averageDuration(routineId, a.id) == null
+  }));
+}
+
+/* ---------------------------------------------------------------------- */
+/* Horario fijo por día de la semana                                       */
+/* ---------------------------------------------------------------------- */
+
+function weekdayKey(routineId, weekday){
+  return `${routineId}::${weekday}`;
+}
+
+function saveWeekdayGoal(routineId, weekday, activityId, time){
+  state.weekdayGoals[weekdayKey(routineId, weekday)] = { activityId, time };
+  saveState();
+}
+
+function getWeekdayGoal(routineId, weekday){
+  return state.weekdayGoals[weekdayKey(routineId, weekday)] || null;
+}
+
+function clearWeekdayGoal(routineId, weekday){
+  delete state.weekdayGoals[weekdayKey(routineId, weekday)];
+  saveState();
+}
+
+// Construye el plan completo del día (pasos de la rutina + hora de dormir
+// recomendada) a partir de un objetivo guardado para ese día de la semana.
+function computeWeekdayPlan(routineId, weekday){
+  const goal = getWeekdayGoal(routineId, weekday);
+  if (!goal) return null;
+  const [h,m] = goal.time.split(':').map(Number);
+  const target = new Date();
+  target.setHours(h,m,0,0);
+
+  const plan = computeBackwardPlan(routineId, target, goal.activityId);
+  const wakeTime = plan.length ? plan[0].time : null;
+  const sleepOptions = wakeTime ? sleepTimesForWake(wakeTime) : [];
+  const recommendedSleep = sleepOptions.find(o => o.recommended) || sleepOptions[0] || null;
+  return { plan, wakeTime, recommendedSleep };
 }
 
 /* ---------------------------------------------------------------------- */
@@ -302,6 +396,18 @@ function renderCurrentView(){
 /* RENDER — Inicio                                                         */
 /* ---------------------------------------------------------------------- */
 
+let openTimeEditIndex = null;   // índice del log que se está corrigiendo ahora mismo
+let weekdayFormDay = new Date().getDay(); // día seleccionado en el formulario de horario fijo
+
+function toTimeInputValue(iso){
+  if (!iso) return '';
+  const d = new Date(iso);
+  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+}
+
+const WEEKDAY_LABELS = ['D','L','M','M','J','V','S'];
+const WEEKDAY_NAMES = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
+
 function renderHome(){
   const el = document.getElementById('home-content');
   const hour = new Date().getHours();
@@ -324,82 +430,196 @@ function renderHome(){
   const session = getTodaySession();
 
   if (!session || session.completed){
-    // Elegir / reiniciar rutina del día
-    const cards = state.routines.map(r => `
-      <button class="card" style="text-align:left; width:100%; cursor:pointer;" data-start="${r.id}">
-        <div class="card-row">
-          <div>
-            <div class="card-title">${escapeHtml(r.name)}</div>
-            <div class="card-sub">${r.activities.length} pasos</div>
-          </div>
-          <span class="badge">Iniciar →</span>
-        </div>
-      </button>`).join('');
-
-    el.innerHTML = `
-      <div class="greeting-card">
-        <div class="greeting-eyebrow">${greet}</div>
-        <div class="greeting-title">${session && session.completed ? 'Rutina completada 🎉' : '¿Qué rutina toca ahora?'}</div>
-        <p class="greeting-sub">${session && session.completed ? 'Puedes ver el detalle en Resumen, o iniciar otra rutina.' : 'Toca una para empezar a registrar tu día.'}</p>
-      </div>
-      <div class="stack">${cards}</div>
-
-      <div class="card" style="margin-top:14px;">
-        <div class="card-title" style="margin-bottom:4px;">🎯 Objetivo de llegada</div>
-        <p class="card-sub" style="margin-bottom:10px;">Dinos a qué hora quieres completar el último paso y calculamos hacia atrás la hora ideal para cada actividad, incluida la de despertar.</p>
-        <div style="display:flex; gap:8px;">
-          <input type="time" id="goal-time-input" class="text-input" value="${defaultTimeValue(6,50)}">
-          <button class="btn-secondary small" id="btn-calc-goal">Calcular</button>
-        </div>
-        <div id="goal-plan" class="stack" style="margin-top:12px;"></div>
-      </div>
-    `;
-
-    el.querySelectorAll('[data-start]').forEach(btn=>{
-      btn.addEventListener('click', ()=>{
-        startSession(btn.dataset.start);
-        renderHome();
-      });
-    });
-
-    const calcGoalBtn = document.getElementById('btn-calc-goal');
-    if (calcGoalBtn) calcGoalBtn.addEventListener('click', ()=>{
-      const val = document.getElementById('goal-time-input').value;
-      if (!val) return;
-      const [h,m] = val.split(':').map(Number);
-      const target = new Date();
-      target.setHours(h,m,0,0);
-      if (target < new Date()) target.setDate(target.getDate()+1);
-
-      const routine = activeRoutine();
-      if (!routine){ toast('Selecciona una rutina activa primero'); return; }
-      const plan = computeBackwardPlan(routine.id, target);
-      document.getElementById('goal-plan').innerHTML = plan.map((p,i)=>`
-        <div class="stat-row">
-          <span>${i===0?'⏰ ':''}${escapeHtml(p.activity.name)}</span>
-          <span class="stat-val">${fmtTimeShort(p.time)}${p.estimated?' *':''}</span>
-        </div>
-      `).join('') + `<div class="card-sub" style="margin-top:4px;">* aún sin datos suficientes — usamos una estimación inicial de 8 min que se irá afinando con tu uso.</div>`;
-    });
+    renderHomeIdle(el, greet, session);
     return;
   }
 
-  // Sesión activa: mostrar únicamente el siguiente paso
+  renderHomeActive(el, greet, session);
+}
+
+/* ---- Pantalla de inicio cuando no hay sesión activa hoy ---- */
+function renderHomeIdle(el, greet, session){
+  const cards = state.routines.map(r => `
+    <button class="card" style="text-align:left; width:100%; cursor:pointer;" data-start="${r.id}">
+      <div class="card-row">
+        <div>
+          <div class="card-title">${escapeHtml(r.name)}</div>
+          <div class="card-sub">${r.activities.length} pasos</div>
+        </div>
+        <span class="badge">Iniciar →</span>
+      </div>
+    </button>`).join('');
+
+  const routine = activeRoutine();
+  const todayWeekday = new Date().getDay();
+  const todayGoal = routine ? getWeekdayGoal(routine.id, todayWeekday) : null;
+  const todayPlan = todayGoal && routine ? computeWeekdayPlan(routine.id, todayWeekday) : null;
+
+  let todayPlanHtml = '';
+  if (todayPlan){
+    todayPlanHtml = `
+      <div class="card" style="margin-top:14px; border-color:var(--turquoise);">
+        <div class="card-title" style="margin-bottom:6px;">📅 Horario fijo de hoy (${WEEKDAY_NAMES[todayWeekday]})</div>
+        ${todayPlan.plan.map((p,i)=>`
+          <div class="stat-row">
+            <span>${i===0?'⏰ ':''}${escapeHtml(p.activity.name)}</span>
+            <span class="stat-val">${fmtTimeShort(p.time)}${p.estimated?' *':''}</span>
+          </div>`).join('')}
+        ${todayPlan.recommendedSleep ? `
+          <div class="stat-row" style="border-top:1px solid var(--border); margin-top:6px; padding-top:10px;">
+            <span>🌙 Dormir recomendado</span>
+            <span class="stat-val">${fmtTimeShort(todayPlan.recommendedSleep.time)} (${todayPlan.recommendedSleep.cycles} ciclos)</span>
+          </div>` : ''}
+        <div class="card-sub" style="margin-top:4px;">* aún sin suficientes datos reales — se usa una estimación inicial que se afina con tu uso.</div>
+      </div>`;
+  }
+
+  el.innerHTML = `
+    <div class="greeting-card">
+      <div class="greeting-eyebrow">${greet}</div>
+      <div class="greeting-title">${session && session.completed ? 'Rutina completada 🎉' : '¿Qué rutina toca ahora?'}</div>
+      <p class="greeting-sub">${session && session.completed ? 'Puedes ver el detalle en Resumen, o iniciar otra rutina.' : 'Toca una para empezar a registrar tu día.'}</p>
+    </div>
+    <div class="stack">${cards}</div>
+
+    ${todayPlanHtml}
+
+    <div class="card" style="margin-top:14px;">
+      <div class="card-title" style="margin-bottom:4px;">🎯 Calcular una vez</div>
+      <p class="card-sub" style="margin-bottom:10px;">Dinos a qué hora quieres completar el último paso y calculamos hacia atrás la hora ideal para cada actividad.</p>
+      <div style="display:flex; gap:8px;">
+        <input type="time" id="goal-time-input" class="text-input" value="${defaultTimeValue(6,50)}">
+        <button class="btn-secondary small" id="btn-calc-goal">Calcular</button>
+      </div>
+      <div id="goal-plan" class="stack" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <div class="card-title" style="margin-bottom:4px;">📅 Horario fijo por día</div>
+      <p class="card-sub" style="margin-bottom:10px;">Ej.: los lunes debes salir de casa a las 5:00 AM, otro día a las 6:00 AM — configúralo una vez y todo se recalculará solo cada vez que abras la app ese día.</p>
+      <div class="mode-toggle" id="weekday-picker" style="flex-wrap:wrap; gap:6px;">
+        ${WEEKDAY_LABELS.map((lbl,i)=>`<button data-day="${i}" class="${i===weekdayFormDay?'active':''}" style="flex:1 1 12%; padding:10px 0;">${lbl}${getWeekdayGoal(routine?.id, i)?' •':''}</button>`).join('')}
+      </div>
+      ${renderWeekdayGoalForm(routine)}
+    </div>
+  `;
+
+  el.querySelectorAll('[data-start]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      startSession(btn.dataset.start);
+      renderHome();
+    });
+  });
+
+  const calcGoalBtn = document.getElementById('btn-calc-goal');
+  if (calcGoalBtn) calcGoalBtn.addEventListener('click', ()=>{
+    const val = document.getElementById('goal-time-input').value;
+    if (!val) return;
+    const [h,m] = val.split(':').map(Number);
+    const target = new Date();
+    target.setHours(h,m,0,0);
+    if (target < new Date()) target.setDate(target.getDate()+1);
+
+    if (!routine){ toast('Selecciona una rutina activa primero'); return; }
+    const plan = computeBackwardPlan(routine.id, target);
+    document.getElementById('goal-plan').innerHTML = plan.map((p,i)=>`
+      <div class="stat-row">
+        <span>${i===0?'⏰ ':''}${escapeHtml(p.activity.name)}</span>
+        <span class="stat-val">${fmtTimeShort(p.time)}${p.estimated?' *':''}</span>
+      </div>
+    `).join('') + `<div class="card-sub" style="margin-top:4px;">* aún sin datos suficientes — usamos una estimación inicial de 8 min que se irá afinando con tu uso.</div>`;
+  });
+
+  document.querySelectorAll('#weekday-picker [data-day]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      weekdayFormDay = Number(btn.dataset.day);
+      renderHome();
+    });
+  });
+
+  wireWeekdayGoalForm(routine);
+}
+
+function renderWeekdayGoalForm(routine){
+  if (!routine) return `<p class="hint">Selecciona una rutina activa primero.</p>`;
+  const existing = getWeekdayGoal(routine.id, weekdayFormDay);
+  const options = routine.activities.map(a =>
+    `<option value="${a.id}" ${existing && existing.activityId===a.id ? 'selected' : (!existing && a.id===routine.activities.at(-1).id ? 'selected':'')}>${escapeHtml(a.name)}</option>`
+  ).join('');
+  return `
+    <div style="margin-top:12px;">
+      <label class="card-sub" style="display:block; margin-bottom:4px;">Actividad objetivo (${WEEKDAY_NAMES[weekdayFormDay]})</label>
+      <select id="weekday-activity-select" class="text-input" style="margin-bottom:8px;">${options}</select>
+      <div style="display:flex; gap:8px;">
+        <input type="time" id="weekday-time-input" class="text-input" value="${existing ? existing.time : defaultTimeValue(5,0)}">
+        <button class="btn-secondary small" id="btn-save-weekday">Guardar</button>
+      </div>
+      ${existing ? `<button class="text-btn danger" id="btn-clear-weekday" style="margin-top:8px;">Eliminar horario de ${WEEKDAY_NAMES[weekdayFormDay]}</button>` : ''}
+    </div>
+  `;
+}
+
+function wireWeekdayGoalForm(routine){
+  const saveBtn = document.getElementById('btn-save-weekday');
+  if (saveBtn) saveBtn.addEventListener('click', ()=>{
+    const activityId = document.getElementById('weekday-activity-select').value;
+    const time = document.getElementById('weekday-time-input').value;
+    if (!time) return;
+    saveWeekdayGoal(routine.id, weekdayFormDay, activityId, time);
+    toast(`Horario de ${WEEKDAY_NAMES[weekdayFormDay]} guardado`);
+    renderHome();
+  });
+  const clearBtn = document.getElementById('btn-clear-weekday');
+  if (clearBtn) clearBtn.addEventListener('click', ()=>{
+    clearWeekdayGoal(routine.id, weekdayFormDay);
+    renderHome();
+  });
+}
+
+/* ---- Pantalla con sesión activa ---- */
+function renderHomeActive(el, greet, session){
   const routine = getRoutine(session.routineId);
   const nextIndex = session.logs.length;
   const nextActivity = routine.activities[nextIndex];
+  const viewMode = state.homeViewMode;
 
-  const timelineHtml = session.logs.map((log,i)=>{
-    const act = routine.activities.find(a=>a.id===log.activityId);
-    const dur = i>0 ? new Date(log.time) - new Date(session.logs[i-1].time) : null;
-    return `
-      <div class="timeline-item">
-        <span class="timeline-dot"></span>
-        <span class="timeline-name">${escapeHtml(act ? act.name : '—')}</span>
-        ${dur!=null ? `<span class="timeline-dur">${fmtDuration(dur)}</span>` : ''}
-        <span class="timeline-time">${fmtTime(log.time)}</span>
-      </div>`;
-  }).join('');
+  const tapButtonHtml = `
+    <button class="tap-btn done-btn" id="btn-log-next">✔ ${escapeHtml(nextActivity.name)}</button>
+    <div class="mini-btn-row">
+      <button class="pill-btn" id="btn-skip-step">Omitir esta actividad</button>
+      ${session.logs.length ? '<button class="pill-btn" id="btn-undo-step">↩ Deshacer último paso</button>' : ''}
+    </div>`;
+
+  let bodyHtml;
+  if (viewMode === 'all'){
+    const rows = routine.activities.map((a,i)=>{
+      if (i < nextIndex){
+        return renderLoggedRow(session, i);
+      } else if (i === nextIndex){
+        return `<div class="next-step-card" style="margin:10px 0;">
+          <div class="next-step-label">Siguiente paso</div>
+          <div class="next-step-name">${escapeHtml(a.name)}</div>
+          ${tapButtonHtml}
+        </div>`;
+      } else {
+        return `<div class="timeline-item" style="opacity:.45;">
+          <span class="timeline-dot" style="background:var(--text-faint);"></span>
+          <span class="timeline-name">${escapeHtml(a.name)}</span>
+        </div>`;
+      }
+    }).join('');
+    bodyHtml = `<div class="card"><div class="card-title" style="margin-bottom:4px;">${escapeHtml(routine.name)} — vista completa</div><div class="timeline">${rows}</div></div>`;
+  } else {
+    const timelineHtml = session.logs.map((log,i) => renderLoggedRow(session, i)).join('');
+    bodyHtml = `
+      <div class="next-step-card">
+        <div class="next-step-label">Siguiente paso</div>
+        <div class="next-step-name">${escapeHtml(nextActivity.name)}</div>
+        ${tapButtonHtml}
+      </div>
+      ${session.logs.length ? `<div class="card"><div class="card-title" style="margin-bottom:6px;">Recorrido de hoy</div><div class="timeline">${timelineHtml}</div></div>` : ''}
+    `;
+  }
 
   el.innerHTML = `
     <div class="greeting-card">
@@ -408,26 +628,39 @@ function renderHome(){
       <p class="greeting-sub">Paso ${nextIndex+1} de ${routine.activities.length}</p>
     </div>
 
-    <div class="next-step-card">
-      <div class="next-step-label">Siguiente paso</div>
-      <div class="next-step-name">${escapeHtml(nextActivity.name)}</div>
-      <button class="tap-btn done-btn" id="btn-log-next">✔ ${escapeHtml(nextActivity.name)}</button>
+    <div class="mode-toggle">
+      <button id="view-mode-single" class="${viewMode==='single'?'active':''}">Paso a paso</button>
+      <button id="view-mode-all" class="${viewMode==='all'?'active':''}">Ver todo</button>
     </div>
 
-    ${session.logs.length ? `<div class="card"><div class="card-title" style="margin-bottom:6px;">Recorrido de hoy</div><div class="timeline">${timelineHtml}</div></div>` : ''}
+    ${bodyHtml}
 
     <div class="mini-btn-row">
       <button class="pill-btn" id="btn-cancel-session">Cancelar sesión</button>
     </div>
   `;
 
+  document.getElementById('view-mode-single').addEventListener('click', ()=>{ state.homeViewMode='single'; saveState(); renderHome(); });
+  document.getElementById('view-mode-all').addEventListener('click', ()=>{ state.homeViewMode='all'; saveState(); renderHome(); });
+
   document.getElementById('btn-log-next').addEventListener('click', ()=>{
-    const act = logNextActivity();
-    if (act) toast(`✔ ${act.name} — ${fmtTimeShort(new Date())}`);
+    const result = logNextActivity(false);
+    if (result) toast(`✔ ${result.activity.name} — ${fmtTimeShort(new Date())}`);
     renderHome();
     if (getTodaySession() && getTodaySession().completed){
       toast('Rutina completada. Mira tu resumen 🎉', 3000);
     }
+  });
+  document.getElementById('btn-skip-step').addEventListener('click', ()=>{
+    const result = logNextActivity(true);
+    if (result) toast(`⏭ ${result.activity.name} omitido`);
+    renderHome();
+  });
+  const undoBtn = document.getElementById('btn-undo-step');
+  if (undoBtn) undoBtn.addEventListener('click', ()=>{
+    undoLastLog();
+    toast('Último paso deshecho');
+    renderHome();
   });
   document.getElementById('btn-cancel-session').addEventListener('click', ()=>{
     state.sessions = state.sessions.filter(s => s.id !== session.id);
@@ -435,6 +668,71 @@ function renderHome(){
     saveState();
     renderHome();
   });
+
+  wireLoggedRowEvents(session);
+}
+
+// Renderiza una fila de una actividad ya registrada (hecha u omitida),
+// incluyendo controles para corregir la hora o excluirla del promedio.
+function renderLoggedRow(session, index){
+  const routine = getRoutine(session.routineId);
+  const log = session.logs[index];
+  const act = routine.activities.find(a=>a.id===log.activityId);
+  const name = act ? act.name : '—';
+
+  if (openTimeEditIndex === index){
+    return `
+      <div class="timeline-item">
+        <input type="time" step="1" class="text-input" id="edit-time-input" style="max-width:130px;" value="${toTimeInputValue(log.time) || defaultTimeValue(new Date().getHours(), new Date().getMinutes())}">
+        <button class="text-btn" data-save-time="${index}">Guardar</button>
+        <button class="text-btn danger" data-cancel-time="${index}">Cancelar</button>
+      </div>`;
+  }
+
+  if (log.skipped){
+    return `
+      <div class="timeline-item">
+        <span class="timeline-dot" style="background:var(--text-faint);"></span>
+        <span class="timeline-name" style="color:var(--text-faint);">${escapeHtml(name)} <em>(omitido)</em></span>
+        <button class="small-icon-btn" title="Corregir hora" data-edit="${index}">✏️</button>
+      </div>`;
+  }
+
+  const dur = sessionStepDuration(session, index);
+  return `
+    <div class="timeline-item">
+      <span class="timeline-dot"></span>
+      <span class="timeline-name" style="${log.excluded ? 'color:var(--text-faint);' : ''}">${escapeHtml(name)}${log.excluded ? ' <em>(no cuenta)</em>' : ''}</span>
+      ${dur!=null ? `<span class="timeline-dur">${fmtDuration(dur)}</span>` : ''}
+      <span class="timeline-time">${fmtTime(log.time)}</span>
+      <button class="small-icon-btn" title="Editar hora" data-edit="${index}">✏️</button>
+      <button class="small-icon-btn" title="${log.excluded ? 'Incluir en el promedio' : 'Excluir del promedio'}" data-toggle-exclude="${index}">${log.excluded ? '↺' : '⦸'}</button>
+    </div>`;
+}
+
+function wireLoggedRowEvents(session){
+  document.querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click', ()=>{
+    openTimeEditIndex = Number(b.dataset.edit);
+    renderHome();
+  }));
+  document.querySelectorAll('[data-cancel-time]').forEach(b=>b.addEventListener('click', ()=>{
+    openTimeEditIndex = null;
+    renderHome();
+  }));
+  document.querySelectorAll('[data-save-time]').forEach(b=>b.addEventListener('click', ()=>{
+    const index = Number(b.dataset.saveTime);
+    const val = document.getElementById('edit-time-input').value; // HH:MM or HH:MM:SS
+    if (!val) return;
+    const parts = val.split(':').map(Number);
+    editLogTime(session.id, index, parts[0], parts[1], parts[2] || 0);
+    openTimeEditIndex = null;
+    toast('Hora corregida');
+    renderHome();
+  }));
+  document.querySelectorAll('[data-toggle-exclude]').forEach(b=>b.addEventListener('click', ()=>{
+    toggleExcludeLog(session.id, Number(b.dataset.toggleExclude));
+    renderHome();
+  }));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -775,19 +1073,25 @@ function renderSummary(){
     const routine = getRoutine(todaySession.routineId);
     const rows = todaySession.logs.map((log,i)=>{
       const act = routine.activities.find(a=>a.id===log.activityId);
-      const dur = i>0 ? new Date(log.time) - new Date(todaySession.logs[i-1].time) : null;
+      if (log.skipped){
+        return `<div class="stat-row"><span style="color:var(--text-faint);">${escapeHtml(act ? act.name : '—')} <em>(omitido)</em></span><span class="stat-val" style="color:var(--text-faint);">—</span></div>`;
+      }
+      const dur = sessionStepDuration(todaySession, i);
       const avg = i>0 ? averageDuration(routine.id, act.id) : null;
       let compareTxt = '';
-      if (dur!=null && avg!=null){
+      if (dur!=null && avg!=null && !log.excluded){
         const diff = dur-avg;
         compareTxt = Math.abs(diff) < 60000 ? ' · igual al promedio' :
           diff>0 ? ` · ${fmtDuration(Math.abs(diff))} más lento` : ` · ${fmtDuration(Math.abs(diff))} más rápido`;
+      } else if (log.excluded){
+        compareTxt = ' · excluido del promedio';
       }
       return `<div class="stat-row"><span>${escapeHtml(act ? act.name : '—')}</span><span class="stat-val">${dur!=null ? fmtDuration(dur) : '—'}</span></div>${compareTxt ? `<div class="card-sub" style="margin:-4px 0 4px;">${compareTxt}</div>`:''}`;
     }).join('');
 
-    const totalMs = todaySession.logs.length>1
-      ? new Date(todaySession.logs.at(-1).time) - new Date(todaySession.logs[0].time)
+    const validLogs = todaySession.logs.filter(l => !l.skipped && l.time);
+    const totalMs = validLogs.length>1
+      ? new Date(validLogs.at(-1).time) - new Date(validLogs[0].time)
       : null;
 
     html += `
@@ -812,17 +1116,21 @@ function renderSummary(){
   }
 
   // Patrones simples por día de la semana (tiempo total de preparación)
-  const completed = state.sessions.filter(s => s.completed && s.logs.length>1);
+  const sessionTotal = s => {
+    const valid = s.logs.filter(l => !l.skipped && l.time);
+    if (valid.length < 2) return null;
+    return { total: new Date(valid.at(-1).time) - new Date(valid[0].time), start: new Date(valid[0].time) };
+  };
+  const completed = state.sessions.filter(s => s.completed && sessionTotal(s) != null);
   if (completed.length >= 3){
     const byDay = {};
     completed.forEach(s=>{
-      const d = new Date(s.logs[0].time);
-      const day = weekdayName(d);
-      const total = new Date(s.logs.at(-1).time) - new Date(s.logs[0].time);
+      const { total, start } = sessionTotal(s);
+      const day = weekdayName(start);
       if (!byDay[day]) byDay[day] = [];
       byDay[day].push(total);
     });
-    const overallAvg = completed.reduce((acc,s)=> acc + (new Date(s.logs.at(-1).time)-new Date(s.logs[0].time)), 0) / completed.length;
+    const overallAvg = completed.reduce((acc,s)=> acc + sessionTotal(s).total, 0) / completed.length;
     const insights = Object.entries(byDay).map(([day, arr])=>{
       const avg = arr.reduce((a,b)=>a+b,0)/arr.length;
       const diff = avg - overallAvg;
