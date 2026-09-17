@@ -652,6 +652,42 @@ function thresholdTimeForCycles(wakeDate, cycles){
   return new Date(wakeDate.getTime() - (cycles*CYCLE_MIN + FALL_ASLEEP_MIN)*60000);
 }
 
+// Corrige la hora de dormir/despertar de una noche ya registrada (conserva
+// las fechas originales, solo ajusta la hora:minuto) y recalcula los ciclos.
+function updateSleepEntryTimes(sessionId, sleepHM, wakeHM){
+  const s = state.sleepSessions.find(x => x.id === sessionId);
+  if (!s) return;
+  const sleepD = new Date(s.sleepTime || s.wakeTime);
+  sleepD.setHours(sleepHM[0], sleepHM[1], 0, 0);
+  const wakeD = new Date(s.wakeTime || s.sleepTime);
+  wakeD.setHours(wakeHM[0], wakeHM[1], 0, 0);
+  s.sleepTime = sleepD.toISOString();
+  s.wakeTime = wakeD.toISOString();
+  s.cyclesActual = Math.max(0, Math.round(((wakeD - sleepD) - FALL_ASLEEP_MIN*60000) / (CYCLE_MIN*60000)));
+  saveState();
+}
+
+// Agrega una noche completa que nunca se registró en su momento (se te
+// olvidó usar la app esa noche, por ejemplo).
+function addManualSleepNight(sleepDateStr, sleepHM, wakeHM){
+  const sleepD = new Date(sleepDateStr + 'T00:00:00');
+  sleepD.setHours(sleepHM[0], sleepHM[1], 0, 0);
+  const wakeD = new Date(sleepD);
+  wakeD.setHours(wakeHM[0], wakeHM[1], 0, 0);
+  if (wakeD <= sleepD) wakeD.setDate(wakeD.getDate() + 1); // cruzó medianoche
+  const session = {
+    id: uid(), mode: 'manual',
+    targetWake: wakeD.toISOString(),
+    sleepTime: sleepD.toISOString(),
+    wakeTime: wakeD.toISOString(),
+    status: 'done',
+    cyclesActual: Math.max(0, Math.round(((wakeD - sleepD) - FALL_ASLEEP_MIN*60000) / (CYCLE_MIN*60000)))
+  };
+  state.sleepSessions.push(session);
+  saveState();
+  return session;
+}
+
 /* ---------------------------------------------------------------------- */
 /* RENDER — navegación                                                     */
 /* ---------------------------------------------------------------------- */
@@ -1321,21 +1357,113 @@ function renderSleep(){
   const past = state.sleepSessions.filter(s => s.status === 'done').slice(-7).reverse();
   if (past.length){
     const avgCycles = (past.reduce((a,s)=>a+(s.cyclesActual||0),0)/past.length).toFixed(1);
+    const withHours = past.filter(s => s.sleepTime && s.wakeTime);
+    const avgHoursMs = withHours.length
+      ? withHours.reduce((a,s)=> a + (new Date(s.wakeTime)-new Date(s.sleepTime)), 0) / withHours.length
+      : null;
+
     html += `
       <div class="card">
         <div class="card-title" style="margin-bottom:8px;">Lo que hemos aprendido</div>
-        <div class="stat-row"><span>Promedio de ciclos (últimas ${past.length} noches)</span><span class="stat-val">${avgCycles}</span></div>
-        ${past.map(s => `
-          <div class="stat-row">
-            <span>${new Date(s.wakeTime || s.targetWake).toLocaleDateString('es-GT',{weekday:'short', day:'numeric', month:'short'})}</span>
-            <span class="stat-val">${s.cyclesActual ?? '—'} ciclos${s.energy ? ' · ' + '⭐'.repeat(s.energy) : ''}</span>
-          </div>`).join('')}
+        <div class="stat-row"><span>Promedio dormido (últimas ${past.length} noches)</span><span class="stat-val">${avgHoursMs!=null ? fmtDuration(avgHoursMs) : '—'}</span></div>
+        <div class="stat-row"><span>Promedio de ciclos</span><span class="stat-val">${avgCycles}</span></div>
+        ${past.map(s => renderSleepHistoryRow(s)).join('')}
+      </div>
+      <div class="card">
+        <button class="text-btn" id="btn-toggle-manual-sleep">+ Agregar una noche manualmente</button>
+        ${showManualSleepForm ? `
+          <div class="stack" style="margin-top:12px;">
+            <div>
+              <label class="card-sub" style="display:block; margin-bottom:4px;">¿Qué noche fue? (fecha en que te dormiste)</label>
+              <input type="date" id="manual-sleep-date" class="text-input" value="${todayKey()}">
+            </div>
+            <div style="display:flex; gap:8px;">
+              <div style="flex:1;">
+                <label class="card-sub" style="display:block; margin-bottom:4px;">Te dormiste</label>
+                <input type="time" id="manual-sleep-time" class="text-input" value="22:00">
+              </div>
+              <div style="flex:1;">
+                <label class="card-sub" style="display:block; margin-bottom:4px;">Despertaste</label>
+                <input type="time" id="manual-wake-time" class="text-input" value="06:00">
+              </div>
+            </div>
+            <button class="btn-secondary small" id="btn-save-manual-sleep">Guardar noche</button>
+          </div>
+        ` : ''}
       </div>
     `;
   }
 
   el.innerHTML = html;
   wireSleepEvents();
+  wireSleepHistoryEvents();
+}
+
+let editingSleepId = null;
+let showManualSleepForm = false;
+
+function renderSleepHistoryRow(s){
+  const dateLabel = new Date(s.wakeTime || s.targetWake).toLocaleDateString('es-GT',{weekday:'short', day:'numeric', month:'short'});
+  const sleptMs = (s.sleepTime && s.wakeTime) ? new Date(s.wakeTime) - new Date(s.sleepTime) : null;
+
+  if (editingSleepId === s.id){
+    return `
+      <div class="timeline-item" style="flex-wrap:wrap; gap:8px;">
+        <span class="timeline-name" style="flex:1 1 100%;">${dateLabel}</span>
+        <div style="display:flex; gap:8px; flex:1 1 100%;">
+          <input type="time" id="edit-sleep-time-${s.id}" class="text-input" value="${toTimeInputValue(s.sleepTime).slice(0,5) || '22:00'}">
+          <input type="time" id="edit-wake-time-${s.id}" class="text-input" value="${toTimeInputValue(s.wakeTime).slice(0,5) || '06:00'}">
+        </div>
+        <button class="text-btn" data-save-sleep="${s.id}">Guardar</button>
+        <button class="text-btn danger" data-cancel-sleep="${s.id}">Cancelar</button>
+      </div>`;
+  }
+
+  return `
+    <div class="timeline-item">
+      <span class="timeline-name">${dateLabel}</span>
+      <span class="timeline-dur">${sleptMs!=null ? fmtDuration(sleptMs) : '—'}</span>
+      <span class="stat-val" style="font-size:12px;">${s.cyclesActual ?? '—'} ciclos${s.energy ? ' · ' + '⭐'.repeat(s.energy) : ''}</span>
+      <button class="small-icon-btn" title="Editar" data-edit-sleep="${s.id}">✏️</button>
+    </div>`;
+}
+
+function wireSleepHistoryEvents(){
+  document.querySelectorAll('[data-edit-sleep]').forEach(b=>b.addEventListener('click', ()=>{
+    editingSleepId = b.dataset.editSleep;
+    renderSleep();
+  }));
+  document.querySelectorAll('[data-cancel-sleep]').forEach(b=>b.addEventListener('click', ()=>{
+    editingSleepId = null;
+    renderSleep();
+  }));
+  document.querySelectorAll('[data-save-sleep]').forEach(b=>b.addEventListener('click', ()=>{
+    const id = b.dataset.saveSleep;
+    const sleepVal = document.getElementById(`edit-sleep-time-${id}`).value;
+    const wakeVal = document.getElementById(`edit-wake-time-${id}`).value;
+    if (!sleepVal || !wakeVal) return;
+    updateSleepEntryTimes(id, sleepVal.split(':').map(Number), wakeVal.split(':').map(Number));
+    editingSleepId = null;
+    toast('Noche corregida');
+    renderSleep();
+  }));
+
+  const toggleManualBtn = document.getElementById('btn-toggle-manual-sleep');
+  if (toggleManualBtn) toggleManualBtn.addEventListener('click', ()=>{
+    showManualSleepForm = !showManualSleepForm;
+    renderSleep();
+  });
+  const saveManualBtn = document.getElementById('btn-save-manual-sleep');
+  if (saveManualBtn) saveManualBtn.addEventListener('click', ()=>{
+    const dateVal = document.getElementById('manual-sleep-date').value;
+    const sleepVal = document.getElementById('manual-sleep-time').value;
+    const wakeVal = document.getElementById('manual-wake-time').value;
+    if (!dateVal || !sleepVal || !wakeVal){ toast('Completa fecha y horas'); return; }
+    addManualSleepNight(dateVal, sleepVal.split(':').map(Number), wakeVal.split(':').map(Number));
+    showManualSleepForm = false;
+    toast('Noche agregada');
+    renderSleep();
+  });
 }
 
 function defaultTimeValue(h,m){
@@ -1446,8 +1574,14 @@ function getActiveSleep(){
 function askEnergyLevel(session){
   const levels = [1,2,3,4,5];
   const wrap = document.getElementById('sleep-content');
+  const sleptMs = (session.sleepTime && session.wakeTime)
+    ? new Date(session.wakeTime) - new Date(session.sleepTime) : null;
   wrap.innerHTML = `
     <div class="card" style="text-align:center;">
+      ${sleptMs != null ? `
+        <div class="card-sub">Dormiste</div>
+        <div class="card-title" style="font-size:26px; margin:4px 0 14px;">${fmtDuration(sleptMs)}</div>
+      ` : ''}
       <div class="card-title" style="margin-bottom:10px;">¿Cómo te sientes al despertar?</div>
       <div class="mini-btn-row">
         ${levels.map(l=>`<button class="pill-btn" data-lvl="${l}">${'⭐'.repeat(l)}</button>`).join('')}
