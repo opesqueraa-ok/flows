@@ -43,6 +43,7 @@ function defaultState(){
     focusActiveType: null, // 'tarea' | 'descanso' | null
     syncCode: null,        // código de sincronización con Firebase (null = no sincroniza)
     lastSavedAt: null,     // timestamp (ms) del último guardado local, para decidir quién gana al sincronizar
+    theme: 'auto',
     averagesDisplayMode: 'duration' // 'duration' = cuánto tardo | 'clock' = a qué hora lo hago
   };
 }
@@ -652,6 +653,49 @@ function thresholdTimeForCycles(wakeDate, cycles){
   return new Date(wakeDate.getTime() - (cycles*CYCLE_MIN + FALL_ASLEEP_MIN)*60000);
 }
 
+// Nota de qué esperar según la duración real de sueño (sin discutir qué es
+// "mejor": cada persona responde distinto, por eso también aprendemos de ti).
+function sleepNoteForMinutes(d){
+  if (d < 15) return 'Muy corta: más que dormir, descansas los ojos.';
+  if (d <= 25) return 'Siesta corta: normalmente despiertas ligero y sin pesadez.';
+  if (d <= 45) return 'Siesta larga: rinde más, pero puede dar un rato de pesadez al despertar.';
+  if (d <= 75) return 'Entras a sueño profundo: dale unos 10 min al despertar antes de exigirte.';
+  if (d <= 105) return 'Cerca de un ciclo completo (~90 min): suele despertar mejor.';
+  const cycles = Math.round(d / CYCLE_MIN);
+  if (Math.abs(d - cycles*CYCLE_MIN) <= 12) return `${cycles} ciclos completos: despiertas en fase ligera.`;
+  return 'No cae en ciclo completo: puede costar un poco más despertar.';
+}
+
+// Promedio de energía que has reportado con duraciones parecidas (±15 min o ±20%).
+function learnedEnergyForMinutes(d){
+  const tol = Math.max(15, d*0.2);
+  const rated = state.sleepSessions.filter(s => s.status==='done' && s.energy && s.sleepTime && s.wakeTime);
+  const near = rated.filter(s => Math.abs((new Date(s.wakeTime)-new Date(s.sleepTime))/60000 - d) <= tol);
+  if (!near.length) return null;
+  return { avg: near.reduce((x,s)=>x+s.energy,0)/near.length, n: near.length };
+}
+
+// Modo C: tengo una ventana de tiempo cualquiera (start -> end). Devuelve
+// cuántos minutos de sueño reales caben y opciones con su hora de alarma.
+function sleepOptionsForWindow(start, end){
+  const windowMin = Math.round((end - start)/60000);
+  const sleepable = windowMin - FALL_ASLEEP_MIN;
+  if (sleepable < 5) return { windowMin, sleepable, options: [] };
+  const wanted = new Set([20,30,40,60]);
+  for (let c=1; c<=7; c++) wanted.add(c*CYCLE_MIN);
+  const list = [...wanted].filter(d => d <= sleepable - 4);
+  list.push(sleepable); // aprovechar todo el rato
+  const uniq = [...new Set(list)].sort((x,y)=>y-x).slice(0,7);
+  const options = uniq.map(d => ({
+    minutes: d,
+    full: d === sleepable,
+    time: new Date(start.getTime() + (FALL_ASLEEP_MIN + d)*60000),
+    note: sleepNoteForMinutes(d),
+    learned: learnedEnergyForMinutes(d)
+  }));
+  return { windowMin, sleepable, options };
+}
+
 // Corrige la hora de dormir/despertar de una noche ya registrada (conserva
 // las fechas originales, solo ajusta la hora:minuto) y recalcula los ciclos.
 function updateSleepEntryTimes(sessionId, sleepHM, wakeHM){
@@ -695,7 +739,7 @@ function addManualSleepNight(sleepDateStr, sleepHM, wakeHM){
 const views = ['home','routines','sleep','more','summary'];
 const moreSubViews = ['cuidado','enfoque','notes'];
 let currentView = 'home';
-let sleepMode = 'A'; // 'A' = hora fija de despertar, 'B' = dormir ahora
+let sleepMode = 'A'; // 'A' = hora fija de despertar, 'B' = dormir ahora, 'C' = tengo un rato (ventana libre)
 let nightTickHandle = null;
 
 function switchView(name){
@@ -1307,8 +1351,9 @@ function renderSleep(){
 
   let html = `
     <div class="mode-toggle">
-      <button id="mode-a" class="${sleepMode==='A'?'active':''}">Tengo hora de despertar</button>
-      <button id="mode-b" class="${sleepMode==='B'?'active':''}">Voy a dormir ahora</button>
+      <button id="mode-a" class="${sleepMode==='A'?'active':''}">Hora de despertar</button>
+      <button id="mode-b" class="${sleepMode==='B'?'active':''}">Dormir ahora</button>
+      <button id="mode-c" class="${sleepMode==='C'?'active':''}">Tengo un rato</button>
     </div>
   `;
 
@@ -1316,7 +1361,12 @@ function renderSleep(){
     const wakeDate = new Date(active.targetWake);
     const cyclesLeft = cyclesAvailableNow(wakeDate);
     let subtitle;
-    if (cyclesLeft >= 1){
+    const isShort = active.mode === 'C';
+    if (isShort){
+      const minLeft = Math.max(0, Math.round((wakeDate - new Date())/60000));
+      subtitle = `Alarma a las ${fmtTimeShort(wakeDate)}. Dormiste desde las ${fmtTimeShort(new Date(active.sleepTime))}.`;
+      active._leftLabel = `Quedan ${minLeft} min`;
+    } else if (cyclesLeft >= 1){
       subtitle = `Si te duermes ahora, alcanzas ${cyclesLeft} ciclo${cyclesLeft===1?'':'s'} completo${cyclesLeft===1?'':'s'}.`;
     } else {
       const lastGood = thresholdTimeForCycles(wakeDate, 1);
@@ -1325,14 +1375,32 @@ function renderSleep(){
     html += `
       <div class="night-indicator" id="night-indicator">
         <div class="small">Despertar objetivo: ${fmtTimeShort(wakeDate)}</div>
-        <div class="big" id="night-cycles">${cyclesLeft >= 0 ? cyclesLeft : 0} ciclos</div>
+        <div class="big" id="night-cycles">${isShort ? active._leftLabel : (cyclesLeft >= 0 ? cyclesLeft : 0) + ' ciclos'}</div>
         <div class="small" id="night-sub">${subtitle}</div>
       </div>
       <button class="tap-btn" id="btn-log-wake" style="margin-top:14px;">✔ Desperté</button>
       <button class="pill-btn" id="btn-cancel-night" style="margin-top:10px; width:100%;">Cancelar seguimiento</button>
     `;
   } else {
-    if (sleepMode === 'A'){
+    if (sleepMode === 'C'){
+      const nowD = new Date();
+      html += `
+        <div class="card">
+          <div class="card-title" style="margin-bottom:6px;">¿Cuánto tiempo tienes?</div>
+          <p class="hint" style="margin:0 0 10px;">Sirve para una siesta o para dormir un rato a cualquier hora: ej. de 5:30 a 6:45.</p>
+          <div style="display:flex; gap:8px;">
+            <div style="flex:1;"><label class="card-sub" style="display:block; margin-bottom:4px;">Desde</label>
+              <input type="time" id="win-start" class="text-input" value="${toTimeInputValue(nowD.toISOString()).slice(0,5)}"></div>
+            <div style="flex:1;"><label class="card-sub" style="display:block; margin-bottom:4px;">Hasta</label>
+              <input type="time" id="win-end" class="text-input" value=""></div>
+          </div>
+          <label class="card-sub" style="display:block; margin:8px 0 4px;">…o dime cuántos minutos tienes en total</label>
+          <input type="number" inputmode="numeric" min="1" id="win-dur" class="text-input" placeholder="ej. 75">
+          <button class="btn-primary full" id="btn-calc-window">Ver opciones</button>
+        </div>
+        <div id="window-options" class="stack"></div>
+      `;
+    } else if (sleepMode === 'A'){
       html += `
         <div class="card">
           <div class="card-title" style="margin-bottom:10px;">¿A qué hora necesitas despertar?</div>
@@ -1367,6 +1435,7 @@ function renderSleep(){
         <div class="card-title" style="margin-bottom:8px;">Lo que hemos aprendido</div>
         <div class="stat-row"><span>Promedio dormido (últimas ${past.length} noches)</span><span class="stat-val">${avgHoursMs!=null ? fmtDuration(avgHoursMs) : '—'}</span></div>
         <div class="stat-row"><span>Promedio de ciclos</span><span class="stat-val">${avgCycles}</span></div>
+        ${renderEnergyByDuration()}
         ${past.map(s => renderSleepHistoryRow(s)).join('')}
       </div>
       <div class="card">
@@ -1399,6 +1468,24 @@ function renderSleep(){
   wireSleepHistoryEvents();
 }
 
+function renderEnergyByDuration(){
+  const buckets = [
+    { label:'Siestas hasta 30 min', test:m=>m<=30 },
+    { label:'31–75 min', test:m=>m>30 && m<=75 },
+    { label:'76–150 min', test:m=>m>75 && m<=150 },
+    { label:'Más de 2.5 h', test:m=>m>150 }
+  ];
+  const rated = state.sleepSessions.filter(s => s.status==='done' && s.energy && s.sleepTime && s.wakeTime)
+    .map(s => ({ m:(new Date(s.wakeTime)-new Date(s.sleepTime))/60000, e:s.energy }));
+  const rows = buckets.map(b => {
+    const xs = rated.filter(r => b.test(r.m));
+    if (!xs.length) return '';
+    const avg = xs.reduce((a,r)=>a+r.e,0)/xs.length;
+    return `<div class="stat-row"><span>${b.label} (${xs.length})</span><span class="stat-val">${avg.toFixed(1)} ⭐</span></div>`;
+  }).join('');
+  return rows ? `<div class="card-sub" style="margin:10px 0 4px;">Cómo te sientes según cuánto duermes</div>${rows}` : '';
+}
+
 let editingSleepId = null;
 let showManualSleepForm = false;
 
@@ -1423,7 +1510,7 @@ function renderSleepHistoryRow(s){
     <div class="timeline-item">
       <span class="timeline-name">${dateLabel}</span>
       <span class="timeline-dur">${sleptMs!=null ? fmtDuration(sleptMs) : '—'}</span>
-      <span class="stat-val" style="font-size:12px;">${s.cyclesActual ?? '—'} ciclos${s.energy ? ' · ' + '⭐'.repeat(s.energy) : ''}</span>
+      <span class="stat-val" style="font-size:12px;">${(sleptMs!=null && sleptMs < 75*60000) ? 'siesta' : (s.cyclesActual ?? '—') + ' ciclos'}${s.energy ? ' · ' + '⭐'.repeat(s.energy) : ''}</span>
       <button class="small-icon-btn" title="Editar" data-edit-sleep="${s.id}">✏️</button>
     </div>`;
 }
@@ -1475,6 +1562,57 @@ function wireSleepEvents(){
   const b = document.getElementById('mode-b');
   if (a) a.addEventListener('click', ()=>{ sleepMode='A'; renderSleep(); });
   if (b) b.addEventListener('click', ()=>{ sleepMode='B'; renderSleep(); });
+
+  const c = document.getElementById('mode-c');
+  if (c) c.addEventListener('click', ()=>{ sleepMode='C'; renderSleep(); });
+
+  const winBtn = document.getElementById('btn-calc-window');
+  if (winBtn) winBtn.addEventListener('click', ()=>{
+    const sv = document.getElementById('win-start').value;
+    const ev = document.getElementById('win-end').value;
+    const dur = Number(document.getElementById('win-dur').value);
+    const out = document.getElementById('window-options');
+    if (!sv){ toast('Pon la hora de inicio'); return; }
+    const start = new Date(); const [sh,sm] = sv.split(':').map(Number);
+    start.setHours(sh, sm, 0, 0);
+    // si "desde" ya pasó hace mucho (>12 h) asumir mañana; si es ahora-ish dejarlo
+    if (start - new Date() < -12*3600000) start.setDate(start.getDate()+1);
+    let end;
+    if (ev){
+      const [eh,em] = ev.split(':').map(Number);
+      end = new Date(start); end.setHours(eh, em, 0, 0);
+      if (end <= start) end.setDate(end.getDate()+1);
+    } else if (dur > 0){
+      end = new Date(start.getTime() + dur*60000);
+    } else { toast('Pon la hora final o los minutos que tienes'); return; }
+
+    const res = sleepOptionsForWindow(start, end);
+    if (!res.options.length){
+      out.innerHTML = `<div class="card"><div class="card-sub">Tienes ${res.windowMin} min. Entre los ${FALL_ASLEEP_MIN} min que tardas en dormirte, casi no queda tiempo de sueño. Mejor cierra los ojos y descansa sin presión.</div></div>`;
+      return;
+    }
+    out.innerHTML = `
+      <div class="card"><div class="card-sub">Tienes ${fmtDuration(res.windowMin*60000)} · descontando ~${FALL_ASLEEP_MIN} min para dormirte, caben <b>${fmtDuration(res.sleepable*60000)}</b> de sueño.</div></div>
+    ` + res.options.map((o,i) => `
+      <div class="cycle-option" data-win-pick="${i}" style="cursor:pointer;">
+        <div>
+          <div class="cycle-time">Alarma ${fmtTimeShort(o.time)}</div>
+          <div class="cycle-meta">${fmtDuration(o.minutes*60000)} de sueño${o.full ? ' · aprovecha todo el rato' : ''}</div>
+          <div class="cycle-note">${o.note}</div>
+          ${o.learned ? `<div class="cycle-note">Tu experiencia con algo parecido: ${'⭐'.repeat(Math.round(o.learned.avg))} (${o.learned.n} vez/veces)</div>` : ''}
+        </div>
+      </div>`).join('') + `<p class="hint">Toca una opción para empezar a dormir con esa alarma.</p>`;
+    out.querySelectorAll('[data-win-pick]').forEach(elm => elm.addEventListener('click', ()=>{
+      const o = res.options[Number(elm.dataset.winPick)];
+      const session = { id: uid(), mode:'C', targetWake: o.time.toISOString(), sleepTime: new Date().toISOString(), status:'sleeping', plannedMinutes: o.minutes, cyclesPlanned: Math.round(o.minutes/CYCLE_MIN) };
+      state.sleepSessions.push(session);
+      state.activeSleepSessionId = session.id;
+      saveState();
+      renderSleep();
+      startNightTicker();
+      toast(`Alarma a las ${fmtTimeShort(o.time)}`);
+    }));
+  });
 
   const calcBtn = document.getElementById('btn-calc-sleep');
   if (calcBtn) calcBtn.addEventListener('click', ()=>{
@@ -1607,6 +1745,11 @@ function startNightTicker(){
     const cyclesEl = document.getElementById('night-cycles');
     const subEl = document.getElementById('night-sub');
     if (!cyclesEl) return;
+    if (s.mode === 'C'){
+      const minLeft = Math.max(0, Math.round((wakeDate - new Date())/60000));
+      cyclesEl.textContent = minLeft > 0 ? `Quedan ${minLeft} min` : 'Ya sonó la alarma';
+      return;
+    }
     cyclesEl.textContent = `${cyclesLeft >= 0 ? cyclesLeft : 0} ciclos`;
     if (cyclesLeft >= 1){
       subEl.textContent = `Si te duermes ahora, alcanzas ${cyclesLeft} ciclo${cyclesLeft===1?'':'s'} completo${cyclesLeft===1?'':'s'}.`;
@@ -1702,7 +1845,7 @@ function renderCuidado(){
 
   list.innerHTML = sorted.map(item => {
     const { nextDue, daysLeft, level } = careStatus(item);
-    const colors = { overdue:'var(--danger)', soon:'#B8860B', ok:'var(--teal-blue)' };
+    const colors = { overdue:'var(--danger)', soon:'var(--warn)', ok:'var(--teal-blue)' };
     const labelText = level === 'overdue'
       ? `Vencido hace ${Math.abs(daysLeft)} día${Math.abs(daysLeft)===1?'':'s'}`
       : level === 'soon'
@@ -2054,8 +2197,28 @@ document.getElementById('btn-add-care').addEventListener('click', ()=>{
   renderCuidado();
 });
 
+function isDarkNow(){
+  const t = state.theme || 'auto';
+  return t === 'dark' || (t === 'auto' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+function applyTheme(){
+  const dark = isDarkNow();
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const m = document.querySelector('meta[name="theme-color"]');
+  if (m) m.content = dark ? '#050816' : '#03045e';
+  const btn = document.getElementById('btn-night-toggle');
+  if (btn) btn.textContent = dark ? '☀️' : '🌙';
+}
+applyTheme();
+if (window.matchMedia) {
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const onChange = ()=>{ if ((state.theme||'auto')==='auto') applyTheme(); };
+  if (mq.addEventListener) mq.addEventListener('change', onChange);
+}
 document.getElementById('btn-night-toggle').addEventListener('click', ()=>{
-  switchView('sleep');
+  state.theme = isDarkNow() ? 'light' : 'dark';
+  saveState();
+  applyTheme();
 });
 
 /* ---------------------------------------------------------------------- */
