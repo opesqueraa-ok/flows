@@ -1,4 +1,4 @@
-const CACHE_NAME = 'fluye-cache-v2';
+const CACHE_NAME = 'fluye-cache-v3';
 const ASSETS = [
   './',
   './index.html',
