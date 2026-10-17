@@ -4,6 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#03045e">
+<script>
+/* Aplica el tema antes de pintar para evitar el destello blanco. */
+(function(){try{
+  var st=JSON.parse(localStorage.getItem('fluye_state_v1')||'{}');
+  var t=st.theme||'auto';
+  var dark=t==='dark'||(t==='auto'&&window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.setAttribute('data-theme',dark?'dark':'light');
+  var m=document.querySelector('meta[name="theme-color"]'); if(m) m.content=dark?'#050816':'#03045e';
+}catch(e){}})();
+</script>
 <title>𝖿𝗅𝗈𝗐𝗌 — Asistente de rutina y sueño</title>
 <meta name="description" content="Asistente personal que aprende tu rutina y tus ciclos de sueño.">
 
@@ -27,7 +37,7 @@
       <span class="brand-mark" aria-hidden="true"></span>
       <span class="brand-name">𝖿𝗅𝗈𝗐𝗌</span>
     </div>
-    <button id="btn-night-toggle" class="icon-btn" title="Modo noche" aria-label="Alternar modo noche">🌙</button>
+    <button id="btn-night-toggle" class="icon-btn" title="Tema claro/oscuro" aria-label="Alternar tema claro u oscuro">🌙</button>
   </header>
 
   <!-- ======= VIEWS ======= -->
